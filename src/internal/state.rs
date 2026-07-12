@@ -186,6 +186,8 @@ type PyObjVec = Vec<NonNull<ffi::PyObject>>;
 #[cfg(not(pyo3_disable_reference_pool))]
 /// Thread-safe storage for objects which were dec_ref while not attached.
 struct ReferencePool {
+    // Whether any decrefs are (or may be) pending
+    dirty: sync::atomic::AtomicBool,
     pending_decrefs: sync::Mutex<PyObjVec>,
 }
 
@@ -193,20 +195,24 @@ struct ReferencePool {
 impl ReferencePool {
     const fn new() -> Self {
         Self {
+            dirty: sync::atomic::AtomicBool::new(false),
             pending_decrefs: sync::Mutex::new(Vec::new()),
         }
     }
 
     fn register_decref(&self, obj: NonNull<ffi::PyObject>) {
         self.pending_decrefs.lock().unwrap().push(obj);
+        self.dirty.store(true, sync::atomic::Ordering::Release);
     }
 
     fn drop_deferred_references(&self, _py: Python<'_>) {
-        let mut pending_decrefs = self.pending_decrefs.lock().unwrap();
-        if pending_decrefs.is_empty() {
+        // A plain load keeps the common, empty case read-only.
+        if !self.dirty.load(sync::atomic::Ordering::Acquire) {
             return;
         }
+        self.dirty.store(false, sync::atomic::Ordering::Relaxed);
 
+        let mut pending_decrefs = self.pending_decrefs.lock().unwrap();
         let decrefs = mem::take(&mut *pending_decrefs);
         drop(pending_decrefs);
 
